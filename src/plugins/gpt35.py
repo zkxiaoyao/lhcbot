@@ -27,8 +27,9 @@ from nonebot.rule import to_me
 from nonebot.log import logger
 from nonebot.params import CommandArg, ArgStr
 from nonebot.rule import Rule
-
-
+# 使用相对导入导入同目录下的 globals
+from .globals import ChatMode
+from .smart import answer
 
 #region 全局变量
 authorization_dict = {}
@@ -51,6 +52,8 @@ in_use_qq_list = []
 #启用群号列表
 in_use_group_id_list= []
 
+#对话模式,初始模式为 NORMAL
+chatMode = ChatMode.NORMAL
 
 
 authorization_dict[0] = 'Bearer eyJhbGciOiJFUzUxMiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjQxNjQ3IiwiZW1haWwiOiIxNDU5NTg0NDQyQHFxLmNvbSIsInB1cnBvc2UiOiJ3ZWIiLCJpYXQiOjE3MjA3MTE0NTUsImV4cCI6MTcyMTkyMTA1NX0.AeZkU1HiyCtL8HROnW5YjV0eiI18eZ0j_iF_V0jjqKhm4vSkZTGXyauM9exTduro4xhMfMlh73JIT8rFE-3y09hvAXHVuoOlV9ZS_5bOxQYjxzkVI-m8Yf4zJ7TJ423O2Rro-RQuUiRSFlE-lgICbJQJwwKFuNkacOdxBxtViXLJP3qn'
@@ -101,14 +104,13 @@ keywords = {
     "question": 7,
     "important": 12,
 }
-# 感兴趣程度阈值
-interest_threshold = 15
+# 感兴趣程度阈值机器人字典
+bot_id_interest_threshold_dict = {}
 
-
-# 当前机器人id
-current_bot_id = None
-
-
+# 群组消息队列
+group_message_dict={}
+# 是否为自发对话
+if_auto_chat = False
 
 
 driver = get_driver()
@@ -116,8 +118,7 @@ lastinput = ""
 lastreply = ""
 lastuser_id = 0
 
-
-
+#=
 
 #用户id信息字典
 user_id_info = {}
@@ -153,7 +154,7 @@ def change_key():
 
 #region 数据初始化
 async def init(bots:dict):
-    global bot_id_role_dict,bot_role_info_dict,bot_id_messageList_dict, current_bot_id, driver,lastinput,lastreply,lastuser_id,in_use_group_id_list,in_use_qq_list
+    global bot_id_role_dict,bot_role_info_dict,bot_id_messageList_dict,  driver,lastinput,lastreply,lastuser_id,in_use_group_id_list,in_use_qq_list
     load_in_use_data()
 
     #初始化缓存
@@ -170,8 +171,6 @@ async def init(bots:dict):
         print(f"{bot_id}:{ bot_id_role_dict[bot_id]}")
 
 
-    # 当前机器人id
-    current_bot_id = None
 
 
 
@@ -241,7 +240,7 @@ def makedata(bot_id:int=3692403280, thisinput: str = "", thisuser: str = "user",
 
     print(f'len:{leng}  free:{free}')
     try:
-        if  leng > 98:
+        if  leng > 200:
             bot_id_messageList_dict[bot_id]=[]
             bot_id_messageList_dict[bot_id].append(rc(thisuser, thisinput))
     except ValueError:
@@ -292,7 +291,7 @@ async def getfriendlist(bot: Bot):
     global frienddesc
     friendlist = await bot.call_api("get_friend_list")
     for i in friendlist:
-        print (i)
+        # print (i)
         user_remark = i.get('remark', '')
         user_name = i.get('nickname', '')
         user_id=i.get('user_id', '')
@@ -323,8 +322,12 @@ async def resolveqq(bot: Bot, user_id: int, gpid: int = 0):
 
 
 async def get_introduction(bot_role: str):
+    global if_auto_chat,group_message_dict
     introduction = bot_role_info_dict.get(str(bot_role),f"You are {bot_role}, a chat robot trained by 周逸舟. You can execute many instructions starting with '/', such as '/e 1+1', '/匹配 周逸舟'. The QQ number of your master is 1459584442.")
     return introduction
+
+#endregion
+#region 规则区
 async def calculate_interest_level(bot_role:str,message: str) -> int:
     global bot_role_keywords_dict,keywords
     interest_keywords = bot_role_keywords_dict.get(bot_role,keywords)
@@ -343,34 +346,100 @@ async def calculate_interest_level(bot_role:str,message: str) -> int:
 
     return interest_level
 
-async def my_rule(bot: Bot, event: Event, state: T_State) -> bool:
+# 配置日志记录器
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+async def if_intrest(bot: Bot, event: Event, state: T_State) -> bool:
+    global bot_id_interest_threshold_dict
     message = event.get_plaintext().strip()
     bot_role = bot_id_role_dict.get(bot.self_id, "SmartBot Bot")
-    interest_level = await calculate_interest_level(bot_role,message)
+    interest_level = await calculate_interest_level(bot_role, message)
+
     # 如果消息中提到机器人，增加权重
     if bot_role in message:
         interest_level += 20
 
-    return interest_level > interest_threshold
+    # 获取或初始化机器人的兴趣阈值
+    current_threshold = bot_id_interest_threshold_dict.setdefault(bot.self_id, 15)
+    logger.info(f"{interest_level} vs {current_threshold}")
+    
+    result = interest_level > current_threshold
 
-special_rule = Rule(my_rule)
+    # 调整兴趣阈值
+    if result:
+        if current_threshold == 15:
+            bot_id_interest_threshold_dict[bot.self_id] = 0
+        else:
+            bot_id_interest_threshold_dict[bot.self_id] += 1
+    else:
+        bot_id_interest_threshold_dict[bot.self_id] = 15
 
+    return result
+
+intrest_rule = Rule(if_intrest)
+
+
+
+async def if_in_group(bot: Bot, event: Event, state: T_State) -> bool:
+    group_id = None
+    if isinstance(event, GroupMessageEvent):
+        group_id = event.group_id
+    elif isinstance(event, PrivateMessageEvent):
+        group_id = 0 
+    return group_id in in_use_group_id_list
+
+in_group_rule = Rule(if_in_group)
 
 #endregion
 
+
+
 #region 对话处理核心区
 #接受消息
-pp = on_message(rule=to_me(), priority=98,block=True)
-pp1 = on_message(rule=special_rule,priority=99,block=True)
 
+
+
+
+
+
+pp1 = on_message(rule=intrest_rule,priority=99,block=True)
 @pp1.handle()
 async def handle_pp1(bot: Bot, event: MessageEvent):
+    global if_auto_chat 
+    if_auto_chat=True
     await handle_pp(bot,event)
 
 
+pp2 = on_message(rule=in_group_rule,priority=97,block=False)
+@pp2.handle()
+async def handle_pp2(bot:Bot, event:MessageEvent):
+    global group_message_dict
+    city =await getCity(bot,event)
+    if isinstance(event, GroupMessageEvent):
+        group_id = event.group_id
+    elif isinstance(event, PrivateMessageEvent):
+        group_id = 0
+    # 初始化群消息列表
+    if group_id not in group_message_dict:
+        group_message_dict[group_id] = []
+    # 添加消息到群消息列表
+    group_message_dict[group_id].append(city)
+    # 获取所有消息并过滤掉None类型的元素
+    combined_messages = ''.join([msg for msg in group_message_dict[group_id] if msg is not None])
+    # 如果消息总长度超过100个字符，删除前面30个字符
+    if len(combined_messages) > 50:
+        combined_messages = combined_messages[-50:]
+        group_message_dict[group_id] = [combined_messages]
+    
+    print(group_message_dict)
+
+
+
+pp = on_message(rule=to_me(), priority=98,block=True)
 @pp.handle()
 async def handle_pp(bot: Bot, event: MessageEvent):
-    global url, lastuser_id, lastinput, lastreply, headers,current_bot_id, in_use_group_id_list, in_use_qq_list,bot_id_messageList_dict,bot_id_role_dict,bot_role_info_dict
+    global url, lastuser_id, lastinput, lastreply, headers, in_use_group_id_list, in_use_qq_list,bot_id_messageList_dict,bot_id_role_dict,bot_role_info_dict,if_auto_chat
     print("现在机器人是:"+str(bot.self_id))
     user_id = event.user_id
     group_id = None
@@ -379,57 +448,50 @@ async def handle_pp(bot: Bot, event: MessageEvent):
     elif isinstance(event, PrivateMessageEvent):
         group_id = 0  
     # print(str(user_id)+"-----------"+str(in_use_qq_list))
-    if user_id not in in_use_qq_list:
-        return
-    if group_id not in in_use_group_id_list:
-        return
-
-    if bot.self_id !=current_bot_id :
-        current_bot_id = bot.self_id
-        # 获取当前机器人的昵称
-        bot_role = bot_id_role_dict.get(bot.self_id, "SmartBot Bot")
-         # 移除旧的系统消息
-        remove_old_system_messages(bot.self_id)
-        # 添加新的系统消息
-        introduction = await get_introduction(bot_role)
-        bot_id_messageList_dict[bot.self_id].append(rc("system", introduction))
-
-   
-    city = str(event.get_message())
-    if 'CQ:image' in city or 'CQ:face' in city:
-        return
     
-    try:
-        city = f'{str(event.reply.sender.user_id)}:"{event.reply.message}"' + city
-    except Exception as e:
-        pass
+    if group_id not in in_use_group_id_list:
+        if user_id not in in_use_qq_list:
+            print("权限不够")
+            return
 
-    try:
-        user_info = await resolveqq(bot=bot, user_id=user_id, gpid=group_id)
-    except:
-        user_info = user_id
-    city = f'{user_info}:' + city
-    user_id_info[str(user_id)] = user_info
-    print ('用户信息:'+user_info)
+    # if bot.self_id !=current_bot_id :
+    # current_bot_id = bot.self_id
+    # 获取当前机器人的昵称
+    bot_role = bot_id_role_dict.get(bot.self_id, "SmartBot Bot")
+        # 移除旧的系统消息
+    remove_old_system_messages(bot.self_id)
+    # 添加新的系统消息
+    introduction = await get_introduction(bot_role)
+    bot_id_messageList_dict[bot.self_id].append(rc("system", introduction))
+    city =await getCity(bot,event)
+    if group_id!=0 and if_auto_chat:
+        city = f"群里的消息记录是{group_message_dict.get(group_id, '暂无群消息，请自行发挥')},请根据群消息记录发表合适的消息和看法，最新的消息是:"+city
+        if_auto_chat=False
+    # user_id_info[str(user_id)] = user_info
+    # print ('用户信息:'+user_info)
     # remove_old_user_messages(bot.self_id)
-    response = requests.post(url, headers=headers,
+    msg = ""
+    if chatMode == ChatMode.NORMAL:
+        response = requests.post(url, headers=headers,
                              data=makedata(bot_id=bot.self_id , thisinput=city, lastinput=lastinput, lastreply=lastreply),
                              stream=True)
-    msg = ""
-    try:
-        decoder = codecs.getincrementaldecoder('utf-8')()
-        for chunk in response.iter_content(chunk_size=1):
-            try:
-                decoded_chunk = decoder.decode(chunk, final=False)
-                print(decoded_chunk, end='')
-                msg += decoded_chunk
-            except UnicodeDecodeError:
-                pass  # 解码错误，继续等待后续数据到达
-        msg = msg[:-6]
-    except Exception as e:
-        msg = f"error:{e}"
-    open('record.txt', 'a', encoding='utf8').write(
-        f'{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}-{user_id}:{city} AI:{msg}\n')
+        try:
+            decoder = codecs.getincrementaldecoder('utf-8')()
+            for chunk in response.iter_content(chunk_size=1):
+                try:
+                    decoded_chunk = decoder.decode(chunk, final=False)
+                    print(decoded_chunk, end='')
+                    msg += decoded_chunk
+                except UnicodeDecodeError:
+                    pass  # 解码错误，继续等待后续数据到达
+            msg = msg[:-6]
+        except Exception as e:
+            msg = f"error:{e}"
+        open('record.txt', 'a', encoding='utf8').write(
+            f'{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}-{user_id}:{city} AI:{msg}\n')
+    elif chatMode == ChatMode.SMART:
+        makedata(bot_id=bot.self_id , thisinput=city, lastinput=lastinput, lastreply=lastreply)
+        msg = answer(bot_id_messageList_dict[bot.self_id])
     lastinput = city
     lastreply = msg
     if lastreply != "" and lastinput != "":
@@ -440,6 +502,27 @@ async def handle_pp(bot: Bot, event: MessageEvent):
     else:
         lastuser_id = user_id
         await pp.finish(message=msg, at_sender=True)
+
+async def getCity(bot: Bot, event: MessageEvent)->str:
+    user_id = event.user_id
+    group_id = None
+    if isinstance(event, GroupMessageEvent):
+        group_id = event.group_id
+    elif isinstance(event, PrivateMessageEvent):
+        group_id = 0  
+    try:
+        user_info = await resolveqq(bot=bot, user_id=user_id, gpid=group_id)
+    except:
+        user_info = user_id
+    city = str(event.get_message())
+    if 'CQ:image' in city or 'CQ:face' in city:
+        return
+    try:
+        city = f'{str(event.reply.sender.user_id)}:"{event.reply.message}"' + city
+    except Exception as e:
+        pass
+    city = f'{user_info}:' + city
+    return city
 
 #endregion
 
@@ -692,4 +775,52 @@ async def handle_city(bot: Bot, event: MessageEvent, city: str = ArgStr("city"))
         await abstract.send(f"群号{qq_number}已开通对话权限，请@我开始聊天。")
     else:
         await bot.send(event, "未能找到有效的qq群号，请重新输入。")
+#endregion 
+
+
+changeMode = on_command("changeMode", priority=5,block=True)
+
+
+@changeMode.handle()
+async def handle_first_receive(state: T_State, arg: Message = CommandArg()):
+    if arg.extract_plain_text().strip():
+        state["city"] = arg.extract_plain_text().strip()
+
+
+@addGroup.got("city", prompt="你要添加哪个群用于对话？请输入qq群号")
+async def handle_city(bot: Bot, event: MessageEvent, city: str = ArgStr("city")):
+    global in_use_group_id_list
+    print("11111111111111111111"+str(city))
+     # 使用正则表达式匹配第一个以数字开头的部分
+    match = re.match(r'\d+', city)
+    
+    if match:
+        # 将匹配到的部分转换为整数
+        qq_number = int(match.group(0))
+        
+        # 将整数添加到 in_use_group_id_list
+        in_use_group_id_list.append(qq_number)
+        #保存数据
+        save_in_use_data()
+        await abstract.send(f"群号{qq_number}已开通对话权限，请@我开始聊天。")
+    else:
+        await bot.send(event, "未能找到有效的qq群号，请重新输入。")
+
+change_mode = on_command("changeMode", priority=5, block=True)
+
+@change_mode.handle()
+async def handle_change_mode(bot: Bot, event: Event):
+    global chatMode
+    if chatMode ==  ChatMode.NORMAL:
+        chatMode = ChatMode.SMART
+    elif chatMode ==  ChatMode.SMART:
+        chatMode = ChatMode.NORMAL
+    await bot.send(event, f"模式已更改为 {chatMode.description}")
+    
+
+show_mode = on_command("showMode", priority=5, block=True)
+
+@show_mode.handle()
+async def handle_show_mode(bot: Bot, event: Event):
+    await bot.send(event, f"当前模式是 {chatMode.description}")
 #endregion 
